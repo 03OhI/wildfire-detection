@@ -1,27 +1,21 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
+import argparse
+from pathlib import Path
+
 import cv2
 import numpy as np
-import uvicorn
 import torch
 import torch.nn as nn
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.staticfiles import StaticFiles
+from ultralytics import YOLO
 
-app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ROOT = Path(__file__).resolve().parent
 
-# ==========================================
-# 🚨 중요: 사용자 정의 클래스는 반드시 모델 로드 전에 위치해야 합니다.
-# ==========================================
+# The training notebook serialized these two blocks under __main__.
+# Running this file directly keeps their original names available to PyTorch.
 
-# 1. SSF 모듈 정의
 class SSF(nn.Module):
     def __init__(self, c1, c2):
         super().__init__()
@@ -55,68 +49,45 @@ class EMBC(nn.Module):
         attended_feat = feat * attn
         return self.cv3(attended_feat)
 
-# ==========================================
-# 클래스 정의가 끝난 후, 모델을 로드합니다.
-# ==========================================
 
-try:
-    model = YOLO('best.pt')
-    print("✅ 모델 로드 성공")
-except Exception as e:
-    print(f"❌ 모델 로드 실패: {e}")
+def create_app(model):
+    app = FastAPI(title="AHE-YOLO11 산불 영상 검출")
 
+    @app.get("/")
+    def read_root():
+        return {"message": "AHE-YOLO11 API Server is running", "ui": "/ui/"}
 
-@app.get("/")
-def read_root():
-    return {"message": "AHE-YOLO11 API Server is running"}
-
-
-@app.post("/analyze")
-def analyze_video_frame(
+    @app.post("/analyze")
+    def analyze_video_frame(
         file: UploadFile = File(...),
-        conf_thres: float = Form(0.25),
-        iou_thres: float = Form(0.45)
-):
-    try:
-        if not file.content_type.startswith("image/"):
-            return {"detections": [], "error": "지원하지 않는 파일 형식입니다. 이미지 파일을 업로드해주세요."}
-
-        contents = file.file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
+        conf_thres: float = Form(0.25, ge=0, le=1),
+        iou_thres: float = Form(0.45, ge=0, le=1),
+    ):
+        if not (file.content_type or "").startswith("image/"):
+            raise HTTPException(415, "이미지 파일을 보내 주세요.")
+        data = np.frombuffer(file.file.read(), dtype=np.uint8)
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
         if frame is None:
-            return {"detections": [], "error": "이미지 디코딩 실패"}
-
-        results = model.predict(
-            source=frame,
-            conf=conf_thres,
-            iou=iou_thres
-        )
+            raise HTTPException(400, "이미지를 읽을 수 없습니다.")
 
         detections = []
-        for r in results:
-            for box in r.boxes:
+        for result in model.predict(frame, conf=conf_thres, iou=iou_thres, verbose=False):
+            for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-
                 detections.append({
-                    "label": r.names[int(box.cls)],
-                    "confidence": round(float(box.conf), 2),
-                    "bbox": [
-                        round(x1, 2),
-                        round(y1, 2),
-                        round(x2 - x1, 2),
-                        round(y2 - y1, 2)
-                    ]
+                    "label": result.names[int(box.cls.item())],
+                    "confidence": round(box.conf.item(), 2),
+                    "bbox": [round(v, 2) for v in (x1, y1, x2 - x1, y2 - y1)],
                 })
-
         return {"detections": detections}
 
-    except Exception as e:
-        print(f"Server Error: {e}")
-        return {"detections": [], "error": str(e)}
-    finally:
-        file.file.close()
+    app.mount("/ui", StaticFiles(directory=ROOT / "web", html=True), name="ui")
+    return app
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    parser = argparse.ArgumentParser(description="산불 화염·연기 검출 서버")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+    model = YOLO(str(ROOT / "weights" / "best.pt"))
+    uvicorn.run(create_app(model), host="127.0.0.1", port=args.port)

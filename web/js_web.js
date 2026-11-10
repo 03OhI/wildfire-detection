@@ -1,105 +1,95 @@
 const video = document.getElementById('mainVideo');
 const canvas = document.getElementById('resultCanvas');
 const ctx = canvas.getContext('2d');
-const videoInput = document.getElementById('videoInput');
-const dropZone = document.getElementById('dropZone');
-const startBtn = document.getElementById('startBtn');
+const input = document.getElementById('videoInput');
+const button = document.getElementById('startBtn');
+const statusText = document.getElementById('status');
+const frame = document.createElement('canvas');
+const frameCtx = frame.getContext('2d');
+let run = 0;
+let analyzing = false;
+let videoUrl;
 
-let isAnalyzing = false;
+function stopAnalysis() {
+    run++;
+    analyzing = false;
+    button.textContent = '▶ 분석 시작';
+}
 
-// 1. 영상 로딩
-dropZone.onclick = () => videoInput.click();
-videoInput.onchange = (e) => {
-    const file = e.target.files[0];
-    if (file) {
-        video.src = URL.createObjectURL(file);
-        video.onloadedmetadata = () => {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            console.log("✅ 비디오 로드 완료:", canvas.width, "x", canvas.height);
-        };
-        video.play();
-    }
+document.getElementById('dropZone').onclick = () => input.click();
+input.onchange = () => {
+    const file = input.files[0];
+    if (!file) return;
+    stopAnalysis();
+    button.disabled = true;
+    statusText.textContent = '';
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    videoUrl = URL.createObjectURL(file);
+    video.src = videoUrl;
+};
+video.onloadeddata = () => {
+    frame.width = canvas.width = video.videoWidth;
+    frame.height = canvas.height = video.videoHeight;
+    button.disabled = false;
+};
+video.onerror = () => {
+    stopAnalysis();
+    button.disabled = true;
+    statusText.textContent = '재생할 수 없는 영상입니다.';
 };
 
-// 2. 슬라이더 업데이트
-document.getElementById('confSlider').oninput = (e) => document.getElementById('confVal').innerText = e.target.value;
-document.getElementById('iouSlider').oninput = (e) => document.getElementById('iouVal').innerText = e.target.value;
-
-// 3. 실시간 분석 루프
-async function analyzeLoop() {
-    if (!isAnalyzing || video.paused || video.ended) {
-        console.log("⏹ 분석 중지됨");
-        return;
-    }
-
-    // 현재 프레임을 캡처할 오프스크린 캔버스
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = video.videoWidth;
-    tempCanvas.height = video.videoHeight;
-    const tempCtx = tempCanvas.getContext('2d');
-    tempCtx.drawImage(video, 0, 0);
-
-    // 4. FastAPI 전송
-    tempCanvas.toBlob(async (blob) => {
-        const formData = new FormData();
-        formData.append('file', blob, 'frame.jpg');
-        formData.append('conf_thres', document.getElementById('confSlider').value);
-        formData.append('iou_thres', document.getElementById('iouSlider').value);
-
-        try {
-            const response = await fetch('http://localhost:8000/analyze', {
-                method: 'POST',
-                body: formData
-            });
-            const data = await response.json();
-            
-            // 데이터가 왔는지 확인하는 로그
-            console.log("📡 서버 응답:", data.detections.length, "개의 객체 탐지됨");
-            
-            drawDetections(data.detections);
-        } catch (err) {
-            console.error("❌ 서버 통신 에러:", err);
-        }
-
-        // 반복 실행 (100ms 간격)
-        if (isAnalyzing) setTimeout(analyzeLoop, 100);
-    }, 'image/jpeg', 0.8);
+for (const key of ['conf', 'iou']) {
+    const slider = document.getElementById(key + 'Slider');
+    slider.oninput = () => document.getElementById(key + 'Val').textContent = slider.value;
 }
 
-// 5. 화면에 그리기
 function drawDetections(detections) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    let fireConf = [];
-    let smokeConf = [];
-    detections.forEach(det => {
+    ctx.lineWidth = 4;
+    ctx.font = 'bold 20px sans-serif';
+    for (const det of detections) {
         const [x, y, w, h] = det.bbox;
-        ctx.strokeStyle = '#ff4d4d'; // 산불이니까 빨간색
-        ctx.lineWidth = 5;
+        ctx.fillStyle = ctx.strokeStyle = det.label === 'fire' ? '#ff534a' : '#00d7e7';
         ctx.strokeRect(x, y, w, h);
-
-        // 텍스트 배경
-        ctx.fillStyle = '#ff4d4d';
-        ctx.font = 'bold 24px Arial';
-        ctx.fillText(`${det.label} ${Math.round(det.confidence * 100)}%`, x, y - 10);
-        if (det.label === 'fire') fireConf.push(det.confidence);
-        else if (det.label === 'smoke') smokeConf.push(det.confidence);
-    });
-    const avgFire = fireConf.length ? fireConf.reduce((a,b) => a+b)/fireConf.length : 0;
-    const avgSmoke = smokeConf.length ? smokeConf.reduce((a,b) => a+b)/smokeConf.length : 0;
-    
-    confChart.data.datasets[0].data = [avgFire, avgSmoke];
-    confChart.update('none'); // 애니메이션 없이 빠르게 업데이트
+        ctx.fillText(det.label + ' ' + Math.round(det.confidence * 100) + '%', x, Math.max(y - 4, 20));
+    }
 }
 
-// 6. 시작 버튼 클릭
-startBtn.onclick = () => {
-    isAnalyzing = !isAnalyzing;
-    startBtn.innerText = isAnalyzing ? "⏹ 분석 중지" : "▶ 분석 시작";
-    startBtn.style.background = isAnalyzing ? "#ef4444" : "#3b82f6";
-    
-    if (isAnalyzing) {
-        console.log("🚀 분석 루프 시작");
-        analyzeLoop();
+async function analyze(id) {
+    while (run === id && analyzing) {
+        frameCtx.drawImage(video, 0, 0);
+        const image = await new Promise(resolve => frame.toBlob(resolve, 'image/jpeg', 0.85));
+        if (run !== id) return;
+        if (!image) throw new Error('영상 프레임을 읽을 수 없습니다.');
+        const data = new FormData();
+        data.append('file', image, 'frame.jpg');
+        data.append('conf_thres', document.getElementById('confSlider').value);
+        data.append('iou_thres', document.getElementById('iouSlider').value);
+        const response = await fetch('/analyze', { method: 'POST', body: data });
+        if (!response.ok) throw new Error('분석 요청 실패 (HTTP ' + response.status + ')');
+        const result = await response.json();
+        if (run !== id) return;
+        drawDetections(result.detections);
+        statusText.textContent = '검출 ' + result.detections.length + '개';
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+}
+
+button.onclick = async () => {
+    if (analyzing) {
+        stopAnalysis();
+        return;
+    }
+    const id = ++run;
+    analyzing = true;
+    button.textContent = '⏹ 분석 중지';
+    try {
+        await video.play();
+        await analyze(id);
+    } catch (err) {
+        if (run !== id) return;
+        stopAnalysis();
+        statusText.textContent = err.message;
     }
 };
